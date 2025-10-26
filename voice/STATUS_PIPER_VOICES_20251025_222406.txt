@@ -1,0 +1,47 @@
+JirehFaith — Piper Voices Status (Male+Female)
+=============================================
+Date: $(date)
+
+Fixed WAV output folder:
+  C:\jf\jirehfaith_swp_kit\voice\wavs
+
+Helper scripts:
+  • C:\jf\jirehfaith_swp_kit\piper\piper_say.sh
+      Usage:
+        piper_say.sh male   "Your text..." [out.wav]
+        piper_say.sh female "Your text..." [out.wav]
+        piper_say.sh male   --file input.txt [out.wav]
+        piper_say.sh female --file input.txt [out.wav]
+  • C:\jf\jirehfaith_swp_kit\piper\piper_say_male.sh  (male-only convenience)
+  • C:\jf\jirehfaith_swp_kit\piper\piper_switch_male.sh  (ryan|bryce)
+  • C:\jf\jirehfaith_swp_kit\piper\piper_voice_status.sh  (status dump)
+
+Profiles folder:
+  C:\jf\jirehfaith_swp_kit\voice\profiles
+
+Active defaults (env files):
+  • male-default.env  → Ryan (en_US-ryan-low_r-steady-a)
+      MODEL_PATH = C:\Users\acade\Downloads\piper male voices\en_US-ryan-low.onnx
+      CONFIG_PATH= C:\Users\acade\Downloads\piper male voices\en_US-ryan-low.onnx.json
+      LENGTH_SCALE=1.14  NOISE_SCALE=0.67  NOISE_W=0.80
+  • female-default.env → AMY (en_US-amy-low v3)
+      MODEL_PATH = C:\jf\jirehfaith_swp_kit\piper\models\en_US-amy-low.onnx
+      CONFIG_PATH= C:\jf\jirehfaith_swp_kit\piper\models\en_US-amy-low.onnx.json
+      LENGTH_SCALE=0.94  NOISE_SCALE=0.30  NOISE_W=0.48
+
+Alternate male profile:
+  • male-bryce.env → Bryce (t1)
+      LENGTH_SCALE=0.95  NOISE_SCALE=0.60  NOISE_W=0.90
+
+Quick-use examples:
+  # Male default (Ryan)
+  /c/jf/jirehfaith_swp_kit/piper/piper_say.sh male "Beloved, take courage."
+  # Female default (AMY)
+  /c/jf/jirehfaith_swp_kit/piper/piper_say.sh female "The Lord is my shepherd."
+  # Switch male default to Bryce then back to Ryan
+  /c/jf/jirehfaith_swp_kit/piper/piper_switch_male.sh bryce
+  /c/jf/jirehfaith_swp_kit/piper/piper_switch_male.sh ryan
+
+Notes:
+- WAVs are saved in C:\jf\jirehfaith_swp_kit\voice\wavs
+- To adjust pacing/naturalness: tweak LENGTH_SCALE (speed), NOISE_SCALE and NOISE_W (naturalness) in the corresponding *.env profile, then re-render.

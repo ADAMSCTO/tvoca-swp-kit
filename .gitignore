@@ -1,0 +1,39 @@
+# === OS/editor cruft ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+~$*
+
+# === Python / logs (if any) ===
+__pycache__/
+*.log
+
+# === Build & cache dirs ===
+/out/
+/ship/
+
+# === Voice artifacts ===
+/voice/wavs/
+
+# Generated timing/sync files (keep original .srt you authored)
+/voice/build/*.autosync.srt
+/voice/build/*.autosync.ass
+
+# Other compiled captions we don't author by hand
+*.ass
+!voice/**/*.ass          # allow if you explicitly want to track ASS in voice/
+voice/build/*.ass        # but ignore build ASS specifically
+
+# Media outputs anywhere
+*.mp4
+*.mov
+*.m4a
+*.aac
+*.wav
+!.keep                    # allow marker files
+
+# Node/npm if it ever shows up
+node_modules/
+dist/

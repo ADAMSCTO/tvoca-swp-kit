@@ -1,0 +1,54 @@
+##### BEGIN:PIPER_SAY_SH v1 #####
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Defaults: AMY (US) — tuned v3
+VOICE="en_US-amy-low.onnx"
+LENGTH_SCALE="0.94"
+NOISE_SCALE="0.30"
+NOISE_W="0.48"
+SENT_SIL="0.55"
+
+IN_TXT=""
+OUT_WAV=""
+
+usage() {
+  echo "Usage: $(basename "$0") -i INPUT.txt -o OUTPUT.wav [-v VOICE.onnx] [--len N] [--noise N] [--noisew N] [--sil N]"
+  echo "Defaults: VOICE=$VOICE LEN=$LENGTH_SCALE NOISE=$NOISE_SCALE NOISE_W=$NOISE_W SIL=$SENT_SIL"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i) IN_TXT="$2"; shift 2 ;;
+    -o) OUT_WAV="$2"; shift 2 ;;
+    -v) VOICE="$2"; shift 2 ;;
+    --len) LENGTH_SCALE="$2"; shift 2 ;;
+    --noise) NOISE_SCALE="$2"; shift 2 ;;
+    --noisew) NOISE_W="$2"; shift 2 ;;
+    --sil) SENT_SIL="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [[ -z "$IN_TXT" || -z "$OUT_WAV" ]]; then
+  usage; exit 1
+fi
+
+BASE="/c/jf/jirehfaith_swp_kit/piper"
+PIPER="$BASE/piper.exe"
+MODEL="$BASE/models/$VOICE"
+
+if [[ ! -f "$MODEL" ]]; then
+  echo "Model not found: $MODEL" >&2
+  exit 2
+fi
+
+cat "$IN_TXT" | "$PIPER" \
+  -m "$MODEL" \
+  -f "$OUT_WAV" \
+  --length_scale "$LENGTH_SCALE" \
+  --noise_scale "$NOISE_SCALE" \
+  --noise_w "$NOISE_W" \
+  --sentence_silence "$SENT_SIL"
+##### END:PIPER_SAY_SH v1 #####

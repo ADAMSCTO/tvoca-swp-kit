@@ -1,0 +1,26 @@
+{
+  "default_rate": 1.0,
+  "default_pitch_semitones": 0,
+  "map": {
+    "anxiety": {
+      "voice": "Calm Alto (female)",
+      "rate": 0.95,
+      "pitch_semitones": -1
+    },
+    "protection": {
+      "voice": "Warm Baritone (male)",
+      "rate": 0.98,
+      "pitch_semitones": -2
+    },
+    "grief": {
+      "voice": "Gentle Alto (female)",
+      "rate": 0.9,
+      "pitch_semitones": -1
+    },
+    "love": {
+      "voice": "Soft Mezzo (female)",
+      "rate": 1.0,
+      "pitch_semitones": 0
+    }
+  }
+}

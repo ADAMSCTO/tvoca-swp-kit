@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # JirehFaith SWP Kit — Single-Screen Launcher (Brand)
-# Flow: Text input/JSON → WAV (piper w/ profile) → SRT → Captioned MP4 (ASS-first v0.2.0)
+# Flow: Text input/JSON → WAV (piper w/ profile) → SRT → Captioned MP4
+# Horizontal now ALWAYS passes .srt to the renderer (renderer handles autosync→ass→normalize→repair→burn).
 
 import json
 import os
@@ -14,8 +15,8 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = APP_ROOT / "tools"
-ASSETS_BG_DIR = APP_ROOT / "assets" / "bg"        # 1080x1920 (vertical, proven)
-ASSETS_BG_H_DIR = APP_ROOT / "assets" / "bg_h"    # 1920x1080 (horizontal, new)
+ASSETS_BG_DIR = APP_ROOT / "assets" / "bg"        # 1080x1920 (vertical)
+ASSETS_BG_H_DIR = APP_ROOT / "assets" / "bg_h"    # 1920x1080 (horizontal)
 ASSETS_BRAND_DIR = APP_ROOT / "assets" / "brand"
 OUT_DEFAULT = APP_ROOT / "out"
 VOICE_BUILD_DIR = APP_ROOT / "voice" / "build"
@@ -23,13 +24,13 @@ VOICE_WAVS_DIR = APP_ROOT / "voice" / "wavs"
 VOICE_PROFILES_DIR = APP_ROOT / "voice" / "profiles"
 PIPER_EXE = APP_ROOT / "piper" / "piper.exe"
 MAKE_BOXED = TOOLS_DIR / "make_vertical_boxed.sh"        # vertical renderer (unchanged)
-RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"     # horizontal renderer (branding comes from BG image)
+RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"     # unified renderer (H uses this)
 
 # Prefer the updated UI-safe SRT builder if present; fallback to legacy frozen one.
 def _resolve_json_to_srt() -> Path:
     candidates = [
-        APP_ROOT / "tools" / "json_to_srt.py",    # preferred (new path)
-        APP_ROOT / "scripts" / "json_to_srt.py",  # legacy (frozen)
+        APP_ROOT / "tools" / "json_to_srt.py",    # preferred
+        APP_ROOT / "scripts" / "json_to_srt.py",  # legacy
     ]
     for c in candidates:
         if c.exists():
@@ -431,7 +432,6 @@ class Launcher(tk.Tk):
             out_mp4 = out_dir / f"{base}_HORIZONTAL_1080p.mp4"
 
         # ---- Background selection (format-aware, with fallback) ----
-        # Use horizontal pack for 1920x1080; otherwise use vertical. If not found, fall back to vertical.
         emotion_key = (self.var_emotion.get() or "").strip()
         emotion_up = emotion_key.upper().replace(" ", "_")
         emotion_lc = emotion_key.lower().replace(" ", "_")
@@ -527,15 +527,9 @@ class Launcher(tk.Tk):
         except Exception as e:
             self._log(f"[warn] normalize failed: {e}\n")
 
-        # Caption selection
-        # Vertical → SRT (let the proven vertical pipeline do its thing)
-        # Horizontal → prefer .autosync.ass (fall back to .ass or SRT)
+        # --- CAPTION SELECTION (locked): both V and H pass SRT to renderer ---
         cap_for_vertical = srt_path
-        base_noext = str(srt_path)[:-4]
-        cap_for_horizontal = Path(base_noext + ".autosync.ass")
-        if not cap_for_horizontal.exists():
-            alt_ass = Path(base_noext + ".ass")
-            cap_for_horizontal = alt_ass if alt_ass.exists() else srt_path
+        cap_for_horizontal = srt_path  # << LOCKED: always .srt for horizontal too
 
         # 3) Render MP4
         bash_path = _detect_git_bash_path()
@@ -548,14 +542,13 @@ class Launcher(tk.Tk):
         if size_sel == "1080x1920":
             b_make = norm_path_for_bash(MAKE_BOXED)
             b_cap  = norm_path_for_bash(cap_for_vertical)
-            self._log(f"[cap] Vertical captions: {cap_for_vertical}\n")
+            self._log(f"[cap] Vertical captions (SRT): {cap_for_vertical}\n")
             env_kv = "LEAD_MS=200 FONT_SIZE=150 MARGIN_L=160 MARGIN_R=160 MARGIN_V=0"
             cmd = f'{env_kv} {b_make} "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
         else:
             b_unified = norm_path_for_bash(RENDER_UNIFIED)
             b_cap     = norm_path_for_bash(cap_for_horizontal)
-            self._log(f"[cap] Horizontal captions: {cap_for_horizontal}\n")
-            # Branding overlays disabled — use baked PNG (no giant transparent logo, gold footer text baked)
+            self._log(f"[cap] Horizontal captions (SRT): {cap_for_horizontal}\n")
             env_kv = 'TOP_BANNER="" BOTTOM_TEXT="" CAPTION_SHIFT_MS=0'
             cmd = f'{env_kv} {b_unified} --size=1920x1080 "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
 

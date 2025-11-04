@@ -25,6 +25,7 @@ VOICE_PROFILES_DIR = APP_ROOT / "voice" / "profiles"
 PIPER_EXE = APP_ROOT / "piper" / "piper.exe"
 MAKE_BOXED = TOOLS_DIR / "make_vertical_boxed.sh"        # vertical renderer (unchanged)
 RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"     # unified renderer (H uses this)
+SRT_RULES_PATH = TOOLS_DIR / "hooks.d" / "srt_rules.sh"  # UI-managed rules file
 
 # Prefer the updated UI-safe SRT builder if present; fallback to legacy frozen one.
 def _resolve_json_to_srt() -> Path:
@@ -158,13 +159,28 @@ def write_tmp_json_from_text(emotion: str, lang: str, voice: str, text: str, bas
     tmp_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return tmp_json
 
+# --- Hooks (UI side) ---------------------------------------------------------
+# Calls tools/hooks/lib/hooks.sh <name> if present; ignore errors.
+ROOT_FOR_HOOKS = APP_ROOT
+def run_ui_hook(name: str, extra_env: dict | None = None):
+    hooks_lib = ROOT_FOR_HOOKS / "tools" / "hooks" / "lib" / "hooks.sh"
+    if not hooks_lib.exists():
+        return
+    env = os.environ.copy()
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
+    try:
+        subprocess.call(["bash", str(hooks_lib), name], env=env)
+    except Exception:
+        pass
+
 # -------- UI --------
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("JirehFaith SWP Kit — Launcher")
-        self.geometry("1020x780")
-        self.minsize(960, 680)
+        self.geometry("1060x900")
+        self.minsize(980, 760)
         self.configure(bg=JF_BG)
 
         ensure_dirs()
@@ -173,7 +189,8 @@ class Launcher(tk.Tk):
         self.var_voice = tk.StringVar(value=VOICE_LABELS[0])
         self.var_emotion = tk.StringVar(value=EMOTIONS[0])
         self.var_lang = tk.StringVar(value=LANGS[0])
-        self.var_size = tk.StringVar(value="1080x1920")  # Default = Shorts (vertical)
+        self.var_size = tk.StringVar(value="1080x1920")   # Default = Shorts (vertical)
+        self.var_font_size = tk.IntVar(value=120)         # UI-controlled caption font size
         self.var_verse = tk.StringVar(value="")
         self.var_json_path = tk.StringVar(value="")
         self.var_out_dir = tk.StringVar(value=str(OUT_DEFAULT))
@@ -186,7 +203,6 @@ class Launcher(tk.Tk):
         self._build_ui()
 
         self.proc = None
-        # streaming logs
         self.log_queue = queue.Queue()
         self.log_thread = None
         self._stop_reader = threading.Event()
@@ -209,6 +225,21 @@ class Launcher(tk.Tk):
         finally:
             tk.Frame(header, bg=JF_GOLD, height=3).pack(fill="x", side="bottom")
 
+        # Menubar: Tools → Hooks… (yaml + folder), Ctrl+H opens hooks.yaml, Ctrl+E inline editor.
+        try:
+            menubar = tk.Menu(self)
+            tools_menu = tk.Menu(menubar, tearoff=0)
+            tools_menu.add_command(label="Hooks… (open hooks.yaml)", command=self._open_hooks_yaml, accelerator="Ctrl+H")
+            tools_menu.add_command(label="Open Hooks Folder", command=self._open_hooks_folder)
+            tools_menu.add_separator()
+            tools_menu.add_command(label="Edit hooks.yaml inline…", command=self._hooks_inline_editor, accelerator="Ctrl+E")
+            menubar.add_cascade(label="Tools", menu=tools_menu)
+            self.config(menu=menubar)
+            self.bind("<Control-h>", lambda e: self._open_hooks_yaml())
+            self.bind("<Control-e>", lambda e: self._hooks_inline_editor())
+        except Exception:
+            pass
+
         # Card
         card = tk.Frame(self, bg="white", bd=0, highlightthickness=1, highlightbackground="#e7e2f3")
         card.pack(fill="both", expand=True, padx=pad, pady=(6, pad))
@@ -228,7 +259,13 @@ class Launcher(tk.Tk):
 
         # Output Size
         self._lbl(row1, "Output Size:").pack(side="left")
-        self._combo(row1, self.var_size, ["1080x1920", "1920x1080"], 12).pack(side="left", padx=(6, 0))
+        self._combo(row1, self.var_size, ["1080x1920", "1920x1080"], 12).pack(side="left", padx=(6, 10))
+
+        # Font size controls
+        self._lbl(row1, "Font:").pack(side="left", padx=(6,0))
+        tk.Button(row1, text="A-", command=lambda: self._font_bump(-6), width=3, bg="#ffffff").pack(side="left", padx=(4,0))
+        self._entry(row1, self.var_font_size, 4).pack(side="left", padx=(4,0))
+        tk.Button(row1, text="A+", command=lambda: self._font_bump(+6), width=3, bg="#ffffff").pack(side="left", padx=(4,0))
 
         # Row 2
         row2 = tk.Frame(frm, bg="white"); row2.pack(fill="x", pady=(2, 6))
@@ -262,6 +299,7 @@ class Launcher(tk.Tk):
         actions = tk.Frame(mid, bg="white"); actions.pack(fill="x", padx=6, pady=(6,0))
         self._btn(actions, "Paste", self.paste_from_clipboard).pack(side="left")
         self._btn(actions, "Copy Input", self.copy_input_to_clipboard).pack(side="left", padx=(6,0))
+        self._btn(actions, "Clear", self.clear_input).pack(side="left", padx=(6,0))
 
         self.txt = tk.Text(mid, height=12, wrap="word", bg="#ffffff", fg=JF_TEXT, insertbackground=JF_PURPLE)
         self.txt.pack(fill="both", expand=True, padx=6, pady=6)
@@ -278,10 +316,44 @@ class Launcher(tk.Tk):
         self._btn(bot, "Open Output Folder", self.open_out_dir).pack(side="left", padx=6)
         self._btn(bot, "Stop", self.on_stop, danger=True).pack(side="left", padx=6)
 
+        # Hooks & Automation panel (visible)
+        hooks_frame = tk.LabelFrame(card, text="Hooks & Automation", bg="white", fg=JF_TEXT, labelanchor="nw")
+        hooks_frame.configure(highlightbackground="#efeaf7", highlightthickness=1)
+        hooks_frame.pack(fill="x", padx=pad, pady=(6, pad))
+
+        self._btn(hooks_frame, "Open hooks.yaml", self._open_hooks_yaml).pack(side="left", padx=(8,4), pady=6)
+        self._btn(hooks_frame, "Open Hooks Folder", self._open_hooks_folder).pack(side="left", padx=4, pady=6)
+        self._btn(hooks_frame, "Edit hooks.yaml inline…", self._hooks_inline_editor).pack(side="left", padx=4, pady=6)
+
+        status = []
+        hooks_yaml = TOOLS_DIR / "hooks.yaml"
+        hooks_lib  = TOOLS_DIR / "hooks" / "lib" / "hooks.sh"
+        status.append(f"hooks.yaml: {'OK' if hooks_yaml.exists() else 'missing'} ({hooks_yaml})")
+        status.append(f"lib/hooks.sh: {'OK' if hooks_lib.exists() else 'missing'} ({hooks_lib})")
+        self._lbl(hooks_frame, " | ".join(status)).pack(side="left", padx=12)
+
+        # --- Rules panel (SRT input transformations) ---
+        rules = tk.LabelFrame(card, text="Hooks & Automation — SRT Rules (tools/hooks.d/srt_rules.sh)", bg="white", fg=JF_TEXT, labelanchor="nw")
+        rules.configure(highlightbackground="#efeaf7", highlightthickness=1)
+        rules.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+
+        r_actions = tk.Frame(rules, bg="white"); r_actions.pack(fill="x", padx=6, pady=(8,0))
+        self._btn(r_actions, "Load", lambda: (self.txt_rules.delete("1.0","end"), self.txt_rules.insert("1.0", self._rules_read_text()))).pack(side="left")
+        self._btn(r_actions, "Save (LF)", self._rules_write_lf).pack(side="left", padx=(6,0))
+        self._btn(r_actions, "Save as CRLF (Windows/Notepad)", self._rules_write_crlf).pack(side="left", padx=(6,0))
+        self._btn(r_actions, "Open srt_rules.sh in Notepad", self._rules_open_in_notepad).pack(side="left", padx=(6,0))
+
+        self.txt_rules = tk.Text(rules, height=10, wrap="none", bg="#ffffff", fg=JF_TEXT, insertbackground=JF_PURPLE)
+        self.txt_rules.pack(fill="both", expand=True, padx=6, pady=6)
+        try:
+            self.txt_rules.insert("1.0", self._rules_read_text())
+        except Exception:
+            pass
+
         # Logs
         log_frame = tk.LabelFrame(card, text="Build logs (streamed)", bg="white", fg=JF_TEXT, labelanchor="nw")
         log_frame.configure(highlightbackground="#efeaf7", highlightthickness=1)
-        log_frame.pack(fill="both", expand=True, padx=pad, pady=(6, pad))
+        log_frame.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
         tools_line = tk.Frame(log_frame, bg="white"); tools_line.pack(fill="x", padx=6, pady=(8,0))
         self._btn(tools_line, "Copy Logs", self.copy_logs).pack(side="left")
@@ -298,6 +370,134 @@ class Launcher(tk.Tk):
                  bg=JF_PURPLE, fg=JF_GOLD, font=("Segoe UI", 14, "bold")
         ).pack(side="left", padx=14, pady=10)
 
+    # --- hooks helpers/UI ---
+    def _open_hooks_yaml(self):
+        try:
+            conf = TOOLS_DIR / "hooks.yaml"
+            if os.name == "nt":
+                subprocess.Popen(["notepad", str(conf)], cwd=str(TOOLS_DIR))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(conf)], cwd=str(TOOLS_DIR))
+            else:
+                subprocess.Popen(["xdg-open", str(conf)], cwd=str(TOOLS_DIR))
+        except Exception as e:
+            self._log(f"[warn] could not open hooks.yaml: {e}\n")
+
+    def _open_hooks_folder(self):
+        try:
+            folder = TOOLS_DIR / "hooks.d"
+            folder.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as e:
+            self._log(f"[warn] could not open hooks folder: {e}\n")
+
+    def _hooks_inline_editor(self):
+        """Inline editor for hooks.yaml with CRLF save option so Notepad shows content reliably."""
+        top = tk.Toplevel(self)
+        top.title("Edit tools/hooks.yaml")
+        top.geometry("780x520")
+        txt = tk.Text(top, wrap="none")
+        txt.pack(fill="both", expand=True)
+
+        hooks_yaml = TOOLS_DIR / "hooks.yaml"
+        try:
+            content = hooks_yaml.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+        txt.insert("1.0", content)
+
+        btns = tk.Frame(top); btns.pack(fill="x")
+        def save_utf8():
+            try:
+                hooks_yaml.write_text(txt.get("1.0","end-1c"), encoding="utf-8", newline="\n")
+                messagebox.showinfo("Saved", f"Saved {hooks_yaml} (LF).")
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+
+        def save_crlf():
+            try:
+                data = txt.get("1.0","end-1c").replace("\r\n","\n").replace("\n","\r\n")
+                hooks_yaml.write_text(data, encoding="utf-8", newline="\r\n")
+                messagebox.showinfo("Saved", f"Saved {hooks_yaml} with CRLF (Windows).")
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+
+        tk.Button(btns, text="Save (LF)", command=save_utf8).pack(side="left", padx=6, pady=6)
+        tk.Button(btns, text="Save as CRLF (Windows/Notepad)", command=save_crlf).pack(side="left", padx=6, pady=6)
+        tk.Button(btns, text="Open in Notepad", command=self._open_hooks_yaml).pack(side="left", padx=6, pady=6)
+
+    # --- rules helpers (UI ↔ tools/hooks.d/srt_rules.sh) ---
+    def _rules_read_text(self) -> str:
+        try:
+            p = SRT_RULES_PATH
+            if not p.exists():
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmpl = [
+                    '#!/usr/bin/env bash',
+                    '# srt_rules.sh — your per-project SRT rewrite rules',
+                    '# Available env when called by renderer:',
+                    '#   SRT_IN  — input .srt',
+                    '#   SRT_OUT — output .srt (write here)',
+                    '#   SIZE    — 1080x1920 or 1920x1080',
+                    '',
+                    'set -euo pipefail',
+                    '',
+                    '# Example (commented): simple find/replace on commas',
+                    '# sed -E "s/,/ — /g" "$SRT_IN" > "$SRT_OUT"',
+                    '',
+                    '# Default passthrough (no change):',
+                    'cp -f "$SRT_IN" "$SRT_OUT"',
+                    ''
+                ]
+                p.write_text("\n".join(tmpl), encoding="utf-8")
+            return p.read_text(encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Read error", f"Could not read rules file:\n{e}")
+            return ""
+
+    def _rules_write_lf(self):
+        try:
+            p = SRT_RULES_PATH
+            p.parent.mkdir(parents=True, exist_ok=True)
+            txt = self.txt_rules.get("1.0", "end-1c")
+            txt = txt.replace("\r\n", "\n")
+            p.write_text(txt, encoding="utf-8")
+            self._log(f"[rules] Saved (LF): {p}\n")
+        except Exception as e:
+            messagebox.showerror("Save error", f"Could not save rules (LF):\n{e}")
+
+    def _rules_write_crlf(self):
+        try:
+            p = SRT_RULES_PATH
+            p.parent.mkdir(parents=True, exist_ok=True)
+            txt = self.txt_rules.get("1.0", "end-1c")
+            txt = txt.replace("\r\n", "\n").replace("\n", "\r\n")
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write(txt)
+            self._log(f"[rules] Saved (CRLF): {p}\n")
+        except Exception as e:
+            messagebox.showerror("Save error", f"Could not save rules (CRLF):\n{e}")
+
+    def _rules_open_in_notepad(self):
+        try:
+            p = SRT_RULES_PATH
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                p.write_text("#!/usr/bin/env bash\r\ncp -f \"$SRT_IN\" \"$SRT_OUT\"\r\n", encoding="utf-8")
+            if os.name == "nt":
+                subprocess.Popen(["notepad", str(p)], cwd=str(p.parent))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)], cwd=str(p.parent))
+            else:
+                subprocess.Popen(["xdg-open", str(p)], cwd=str(p.parent))
+        except Exception as e:
+            self._log(f"[warn] could not open srt_rules.sh: {e}\n")
+
     # --- ui helpers ---
     def _lbl(self, parent, text): return tk.Label(parent, text=text, bg="white", fg=JF_TEXT, font=("Segoe UI", 10))
     def _entry(self, parent, var, width): return tk.Entry(parent, textvariable=var, width=width, bg="#ffffff", fg=JF_TEXT, insertbackground=JF_PURPLE, relief="solid", bd=1, highlightthickness=0)
@@ -308,7 +508,18 @@ class Launcher(tk.Tk):
         elif danger: bg, fg, abg = "#7a1022", "#ffffff", "#5c0c1a"
         return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, activebackground=abg, activeforeground=fg, relief="raised", bd=1)
 
+    def _font_bump(self, delta: int):
+        try:
+            v = int(self.var_font_size.get())
+        except Exception:
+            v = 120
+        v = max(40, min(240, v + delta))  # clamp to sane range
+        self.var_font_size.set(v)
+
     # --- clipboard ---
+    def clear_input(self):
+        self.txt.delete("1.0", "end")
+
     def paste_from_clipboard(self):
         try:
             data = self.clipboard_get()
@@ -351,7 +562,7 @@ class Launcher(tk.Tk):
         path = Path(self.var_out_dir.get() or OUT_DEFAULT)
         try:
             if os.name == "nt":
-                os.startfile(str(path))
+                os.startfile(str(path))  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
                 subprocess.run(["open", str(path)], check=False)
             else:
@@ -464,7 +675,7 @@ class Launcher(tk.Tk):
         except Exception as e:
             messagebox.showerror("Profile error", str(e)); return
 
-        # 1) WAV (Piper with profile)
+        # 1) WAV (Piper with profile) + TTS hooks
         try:
             text_for_tts = build_text_from_json(json_path)
         except Exception as e:
@@ -473,6 +684,9 @@ class Launcher(tk.Tk):
 
         self._log(f"[tts] {voice_label} → {wav_path}\n")
         try:
+            # === pre_tts hook ===
+            run_ui_hook("pre_tts", {"SIZE": size_sel, "WAV": str(wav_path)})
+
             create_flags = 0
             if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
                 create_flags = subprocess.CREATE_NO_WINDOW
@@ -492,6 +706,10 @@ class Launcher(tk.Tk):
                 capture_output=True,
                 creationflags=create_flags,
             )
+
+            # === post_tts hook ===
+            run_ui_hook("post_tts", {"SIZE": size_sel, "WAV": str(wav_path)})
+
             self._log(p.stdout or "")
             if p.returncode != 0:
                 self._log(p.stderr or "")
@@ -529,7 +747,7 @@ class Launcher(tk.Tk):
 
         # --- CAPTION SELECTION (locked): both V and H pass SRT to renderer ---
         cap_for_vertical = srt_path
-        cap_for_horizontal = srt_path  # << LOCKED: always .srt for horizontal too
+        cap_for_horizontal = srt_path  # always .srt for horizontal too
 
         # 3) Render MP4
         bash_path = _detect_git_bash_path()
@@ -539,17 +757,23 @@ class Launcher(tk.Tk):
         b_wav  = norm_path_for_bash(wav_path)
         b_out  = norm_path_for_bash(out_mp4)
 
+        # capture requested font size
+        try:
+            fs = int(self.var_font_size.get() or 120)
+        except Exception:
+            fs = 120
+
         if size_sel == "1080x1920":
             b_make = norm_path_for_bash(MAKE_BOXED)
             b_cap  = norm_path_for_bash(cap_for_vertical)
             self._log(f"[cap] Vertical captions (SRT): {cap_for_vertical}\n")
-            env_kv = "LEAD_MS=200 FONT_SIZE=150 MARGIN_L=160 MARGIN_R=160 MARGIN_V=0"
+            env_kv = f"LEAD_MS=200 FONT_SIZE={fs} MARGIN_L=160 MARGIN_R=160 MARGIN_V=0"
             cmd = f'{env_kv} {b_make} "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
         else:
             b_unified = norm_path_for_bash(RENDER_UNIFIED)
             b_cap     = norm_path_for_bash(cap_for_horizontal)
             self._log(f"[cap] Horizontal captions (SRT): {cap_for_horizontal}\n")
-            env_kv = 'TOP_BANNER="" BOTTOM_TEXT="" CAPTION_SHIFT_MS=0'
+            env_kv = f'FONT_SIZE={fs} TOP_BANNER="" BOTTOM_TEXT="" CAPTION_SHIFT_MS=0'
             cmd = f'{env_kv} {b_unified} --size=1920x1080 "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
 
         self._log(f"[render] {cmd}\n")

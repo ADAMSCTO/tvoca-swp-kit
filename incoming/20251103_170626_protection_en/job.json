@@ -1,0 +1,9 @@
+{
+  "job_id": "20251103_170626_protection_en",
+  "emotion": "protection",
+  "lang": "en",
+  "platforms": ["tiktok","shorts","reels"],
+  "first_frame": "A 15-second prayer for peace",
+  "audio": { "target_lufs": -15.0, "true_peak_db": -1.0 },
+  "render": { "resolution": "1080x1920", "style": "CenterBox" }
+}

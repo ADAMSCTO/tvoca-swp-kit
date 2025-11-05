@@ -37,3 +37,5 @@ voice/build/*.ass        # but ignore build ASS specifically
 # Node/npm if it ever shows up
 node_modules/
 dist/
+_snapshots/*.tar.gz
+_snapshots/*.zip

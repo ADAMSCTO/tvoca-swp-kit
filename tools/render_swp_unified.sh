@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Unified renderer for SWP videos (H & V) with enforced CenterBox style.
-# Accepts SRT or ASS. For SRT: autosync -> ASS. For both: normalize -> repair -> burn with ass filter.
-# Parity with vertical pipeline; adds robust BG fit and hook exports.
-# Adds Open-Title overlay (TOP_BANNER env) shown only at t=0–1.50s without touching captions.
+# Accepts SRT or ASS. For SRT: autosync -> ASS. For both: normalize -> repair -> optional gate -> burn with ass filter.
+# Adds Open-Title overlay (TOP_BANNER env) shown only at t=0–BANNER_SECONDS without touching captions unless gating is needed.
 set -euo pipefail
 
 # --- Args --------------------------------------------------------------------
@@ -47,6 +46,8 @@ AUTOSYNC="${AUTOSYNC:-1}"
 BG_FIT="${BG_FIT:-cover}"
 
 TOP_BANNER="${TOP_BANNER:-}"
+BANNER_SECONDS="${BANNER_SECONDS:-1.50}"
+TITLE_GAP="${TITLE_GAP:-0.20}"                   # extra gap after title
 TOP_FONT_SIZE="${TOP_FONT_SIZE:-$(( ${FONT_SIZE:-96} + 8 ))}"
 
 # --- PlayRes -----------------------------------------------------------------
@@ -79,7 +80,7 @@ repair_bad_ts() {
   fi
   awk -F',' '
     function hms_to_ms(t,  a){return match(t,/^([0-9]+):([0-9]{2}):([0-9]{2})\.([0-9]{2})$/,a)?(a[1]*3600000+a[2]*60000+a[3]*1000+a[4]*10):-1}
-    function ms_to_hms(MS,cs,s,m,h){cs=int((MS%1000)/10);s=int((MS/1000)%60);m=int((MS/60000)%60);h=int(MS/3600000);return sprintf("%d:%02d:%02d.%02d",h,m,s,cs)}
+    function ms_to_hms(MS,cs,s,m,h){if(MS<0) MS=0; cs=int((MS%1000)/10); s=int((MS/1000)%60); m=int((MS/60000)%60); h=int(MS/3600000);return sprintf("%d:%02d:%02d.%02d",h,m,s,cs)}
     BEGIN{OFS=","}
     /^\[Script Info\]|^\[V4\+ Styles\]|^\[Events\]|^Format:|^Comment:/{print;next}
     /^Dialogue:/{
@@ -94,19 +95,32 @@ repair_bad_ts() {
 
 count_dialogue() { grep -c '^Dialogue:' "$1" || true; }
 
-derive_srt_sibling() {
-  local asspath="$1" dir base s1 s2
-  dir="$(dirname "$1")"
-  base="$(basename "$1")"
-  base="${base%.ass}"; base="${base%.autosync}"; base="${base%.norm}"; base="${base%.repaired}"
-  s1="$dir/${base}.srt"; s2="$BUILD/${base}.srt"
-  [[ -f "$s1" ]] && { echo "$s1"; return; }
-  [[ -f "$s2" ]] && { echo "$s2"; return; }
-  echo ""
+min_start_ms() {
+  awk -F',' '
+    function hms_to_ms(t, a){return match(t,/^([0-9]+):([0-9]{2}):([0-9]{2})\.([0-9]{2})$/,a)?(a[1]*3600000+a[2]*60000+a[3]*1000+a[4]*10):-1}
+    BEGIN{min=999999999}
+    /^Dialogue:/{ m=hms_to_ms($2); if(m>=0 && m<min) min=m }
+    END{ print min }
+  ' "$1"
+}
+
+shift_ass_times() {
+  local ass_in="$1" ass_out="$2" shift_ms="$3"
+  awk -F',' -v OFS="," -v SH=shift_ms '
+    function hms_to_ms(t, a){return match(t,/^([0-9]+):([0-9]{2}):([0-9]{2})\.([0-9]{2})$/,a)?(a[1]*3600000+a[2]*60000+a[3]*1000+a[4]*10):-1}
+    function ms_to_hms(MS,cs,s,m,h){if(MS<0) MS=0; cs=int((MS%1000)/10); s=int((MS/1000)%60); m=int((MS/60000)%60); h=int(MS/3600000); return sprintf("%d:%02d:%02d.%02d",h,m,s,cs)}
+    /^\[Script Info\]|^\[V4\+ Styles\]|^\[Events\]|^Format:/ {print; next}
+    /^Dialogue:/{
+      s=hms_to_ms($2); e=hms_to_ms($3);
+      if(s>=0 && e>=0){ s=s+SH; e=e+SH; $2=ms_to_hms(s); $3=ms_to_hms(e) }
+      print; next
+    }
+    {print}
+  ' "$ass_in" > "$ass_out"
 }
 
 log_i(){ echo "[i] $*"; }
-log_w(){ echo "[warn] $*" >&2; }
+log_w(){ echo "[warn] $*"; }
 log_e(){ echo "[err] $*" >&2; }
 
 # --- Get ASS (convert from SRT if needed) ------------------------------------
@@ -134,34 +148,22 @@ run_hooks pre_ass_normalize || true; normalize_ass "$ASS_NORM" || true
 ASS_REPAIRED="$BUILD/$(basename "${ASS_RAW%.*}").repaired.ass"; repair_bad_ts "$ASS_NORM" "$ASS_REPAIRED"
 DCOUNT="$(count_dialogue "$ASS_REPAIRED")"
 
-# --- Auto-fallback: if 0 events, rebuild from sibling SRT -------------------
-if [[ "${DCOUNT:-0}" -le 0 ]]; then
-  log_w "0 Dialogue events after repair — attempting ASS→SRT recovery…"
-  SIB_SRT="$(derive_srt_sibling "$ASS_RAW")"
-  if [[ -n "$SIB_SRT" && -f "$SIB_SRT" ]]; then
-    log_i "Found SRT sibling: $(cygpath -w "$SIB_SRT")"
-    tmp_srt2="$BUILD/.$(basename "$SIB_SRT").lf.srt"; to_lf_file "$SIB_SRT" "$tmp_srt2"
-    SRT_SYNC2="$BUILD/$(basename "${SIB_SRT%.*}").autosync.srt"
-    export SRT_IN="$SIB_SRT"; run_hooks pre_autosync || true
-    if [[ "$AUTOSYNC" == "0" ]]; then cp -f "$tmp_srt2" "$SRT_SYNC2"; log_i "Autosync disabled — copied sibling SRT to $(cygpath -w "$SRT_SYNC2")"
-    else log_i "Autosync sibling SRT → $(cygpath -w "$SRT_SYNC2") (lead=${LEAD_MS}ms)"; bash "$TOOLS/srt_autosync.sh" "$tmp_srt2" "$WAV" "$SRT_SYNC2" "$LEAD_MS"; fi
-    run_hooks post_autosync || true
-    ASS_RAW2="$BUILD/$(basename "${SIB_SRT%.*}").autosync.ass"
-    ffmpeg -hide_banner -y -i "$SRT_SYNC2" -c:s ass "$ASS_RAW2" >/dev/null 2>&1
-    log_i "Rebuilt ASS from sibling SRT: $(cygpath -w "$ASS_RAW2")"
-    ASS_NORM="$BUILD/$(basename "${ASS_RAW2%.*}").norm.ass"; to_lf_file "$ASS_RAW2" "$ASS_NORM"
-    run_hooks pre_ass_normalize || true; normalize_ass "$ASS_NORM" || true
-    ASS_REPAIRED="$BUILD/$(basename "${ASS_RAW2%.*}").repaired.ass"; repair_bad_ts "$ASS_NORM" "$ASS_REPAIRED"
-    DCOUNT="$(count_dialogue "$ASS_REPAIRED")"
-  else
-    log_w "No SRT sibling found for recovery."
-  fi
-fi
-
 if [[ "${DCOUNT:-0}" -le 0 ]]; then
   log_e "After repair, no Dialogue events remain in: $(cygpath -w "$ASS_REPAIRED")"
-  log_e "libass would load 0 events — captions would be invisible. Investigate timestamps."
   exit 7
+fi
+
+# --- Gate first caption to be after title ------------------------------------
+if [[ -n "$TOP_BANNER" ]]; then
+  need_ms=$(awk -v a="$BANNER_SECONDS" -v g="$TITLE_GAP" 'BEGIN{printf "%.0f",(a+g)*1000}')
+  first_ms="$(min_start_ms "$ASS_REPAIRED")"
+  if [[ "$first_ms" -lt "$need_ms" ]]; then
+    delta_ms=$(( need_ms - first_ms ))
+    ASS_SHIFTED="$BUILD/$(basename "${ASS_RAW%.*}").shifted.ass"
+    shift_ass_times "$ASS_REPAIRED" "$ASS_SHIFTED" "$delta_ms"
+    mv -f "$ASS_SHIFTED" "$ASS_REPAIRED"
+    log_i "Gated first caption: +${delta_ms}ms (first=${first_ms}ms < need=${need_ms}ms)"
+  fi
 fi
 
 # --- Paths for ass= filter ---------------------------------------------------
@@ -172,7 +174,7 @@ echo "[i] BG=$(cygpath -w "$BG")"
 echo "[i] WAV=$(cygpath -w "$WAV")"
 echo "[i] ASS=$(cygpath -w "$ASS_REPAIRED")  (events=${DCOUNT})"
 
-# --- Optional Open-Title (0–1.50s, CenterBox look, NO fade-in) ---------------
+# --- Optional Open-Title (0–BANNER_SECONDS, CenterBox) -----------------------
 BASS_ESC=""
 if [[ -n "$TOP_BANNER" ]]; then
   BASS="$BUILD/.open_title.${PRX}x${PRY}.ass"; : > "$BASS"
@@ -183,9 +185,9 @@ if [[ -n "$TOP_BANNER" ]]; then
   printf '%s\n' "[Events]" >> "$BASS"
   printf '%s\n' "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text" >> "$BASS"
   esc_title="${TOP_BANNER//\\/\\\\}"; esc_title="${esc_title//\{/\{}"; esc_title="${esc_title//\}/\}}"; esc_title="${esc_title//$'\r'/}"; esc_title="${esc_title//$'\n'/\\N}"
-  printf '%s\n' "Dialogue: 0,0:00:00.00,0:00:01.50,OpenTitle,,0,0,0,,{\an5\b1}${esc_title}" >> "$BASS"
+  printf '%s\n' "Dialogue: 0,0:00:00.00,0:00:${BANNER_SECONDS},OpenTitle,,0,0,0,,${esc_title}" >> "$BASS"
   BASS_MIXED="$(cygpath -m "$BASS")"; BASS_ESC="${BASS_MIXED/:/\\:}"
-  echo "[i] Open-Title enabled (0–1.50s): ${TOP_BANNER}"
+  echo "[i] Open-Title enabled (0–${BANNER_SECONDS}s): ${TOP_BANNER}"
 fi
 
 # --- Background fit ----------------------------------------------------------

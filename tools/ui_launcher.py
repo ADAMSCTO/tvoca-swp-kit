@@ -2,17 +2,21 @@
 # JirehFaith SWP Kit — Single-Screen Launcher (Brand)
 # Flow: Text input/JSON → WAV (piper w/ profile) → SRT → Captioned MP4
 # Horizontal and Vertical both pass .srt to the renderer (renderer handles autosync→ass→normalize→repair→burn).
-# Hooks UI removed; Open-Title is the only overlay control (passed via TOP_BANNER env).
+# Hooks UI removed; Open-Title is the only overlay control (POSTER ONLY).
+# Poster button uses Open-Title + Font size + Output Size + Emotion BG.
+# IMPORTANT: For video renders we now FORCE TOP_BANNER='' (no title over captions).
 
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import textwrap
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = APP_ROOT / "tools"
@@ -168,6 +172,25 @@ def _bash_literal(s: str) -> str:
         return "''"
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
+def _default_fontfile() -> str | None:
+    candidates = [
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\Arial.ttf",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+def _ffmpeg_path() -> str:
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+def _ff_filter_path(p: Path | str) -> str:
+    s = str(p).replace("\\", "/")
+    if len(s) >= 2 and s[1] == ":":
+        s = s[0] + r"\:" + s[2:]
+    return s
+
 # -------- UI --------
 class Launcher(tk.Tk):
     def __init__(self):
@@ -184,13 +207,13 @@ class Launcher(tk.Tk):
         self.var_emotion = tk.StringVar(value=EMOTIONS[0])
         self.var_lang = tk.StringVar(value=LANGS[0])
         self.var_size = tk.StringVar(value="1080x1920")   # Default = Shorts (vertical)
-        self.var_font_size = tk.IntVar(value=120)         # UI-controlled caption font size
+        self.var_font_size = tk.IntVar(value=120)         # UI-controlled caption/poster font size
         self.var_verse = tk.StringVar(value="")
         self.var_json_path = tk.StringVar(value="")
         self.var_out_dir = tk.StringVar(value=str(OUT_DEFAULT))
         self.var_title = tk.StringVar(value="anxiety_en_amy")
         self.var_auto_title = tk.BooleanVar(value=True)
-        # Open-Title overlay (on-screen only; not part of captions/voice)
+        # Open-Title overlay (POSTER ONLY; not used for video renders)
         self.var_open_title = tk.StringVar(value="")
 
         for v in (self.var_voice, self.var_emotion, self.var_lang):
@@ -272,9 +295,9 @@ class Launcher(tk.Tk):
         self._lbl(row3, "Output base name:").pack(side="left")
         self._entry(row3, self.var_title, 40).pack(side="left", padx=(6, 20))
 
-        # Row 4 — Open-Title (on screen only)
+        # Row 4 — Open-Title (POSTER ONLY)
         row4 = tk.Frame(frm, bg="white"); row4.pack(fill="x", pady=(2, 6))
-        self._lbl(row4, "Open-title (on screen only):").pack(side="left")
+        self._lbl(row4, "Open-title (for Poster only):").pack(side="left")
         self._entry(row4, self.var_open_title, 46).pack(side="left", padx=(6, 20))
 
         # Middle
@@ -301,6 +324,8 @@ class Launcher(tk.Tk):
         self.btn_start = self._btn(bot, "Start", self.on_start, primary=True); self.btn_start.pack(side="left")
         self._btn(bot, "Open Output Folder", self.open_out_dir).pack(side="left", padx=6)
         self._btn(bot, "Stop", self.on_stop, danger=True).pack(side="left", padx=6)
+        # Poster generator
+        self._btn(bot, "Make Poster (from Open-Title)", self.on_make_poster).pack(side="left", padx=12)
 
         # Logs
         log_frame = tk.LabelFrame(card, text="Build logs (streamed)", bg="white", fg=JF_TEXT, labelanchor="nw")
@@ -457,6 +482,7 @@ class Launcher(tk.Tk):
         srt_path = VOICE_BUILD_DIR / f"{base}.srt"
 
         # Output file name depends on size
+        size_sel = (self.var_size.get() or "1080x1920").strip()
         if size_sel == "1080x1920":
             out_mp4 = out_dir / f"{base}_VERTICAL_BOXED.mp4"
         else:
@@ -576,10 +602,10 @@ class Launcher(tk.Tk):
         except Exception:
             fs = 120
 
-        # Open-Title env (bash safe)
-        open_title = self.var_open_title.get() or ""
-        top_banner_literal = _bash_literal(open_title)
+        # For video renders we FORCE no title overlay:
+        top_banner_literal = "''"  # <- this is the fix: pass empty to renderers
 
+        size_sel = (self.var_size.get() or "1080x1920").strip()
         if size_sel == "1080x1920":
             b_make = norm_path_for_bash(MAKE_BOXED)
             b_cap  = norm_path_for_bash(cap_for_vertical)
@@ -610,6 +636,94 @@ class Launcher(tk.Tk):
 
         self.log_thread = threading.Thread(target=self._reader_thread_with_done, args=(out_mp4,), daemon=True)
         self.log_thread.start()
+
+    # --- Poster generator (Open-Title + Font size + Output Size + Emotion BG) ---
+    def on_make_poster(self):
+        title = (self.var_open_title.get() or "").strip()
+        if not title:
+            messagebox.showwarning("Open-Title required", "Enter a title in the “Open-title (for Poster only)” field first.")
+            return
+
+        size_sel = (self.var_size.get() or "1080x1920").strip()
+        out_dir = Path(self.var_out_dir.get().strip() or OUT_DEFAULT); out_dir.mkdir(parents=True, exist_ok=True)
+        base = self.var_title.get().strip() or "poster"
+
+        if size_sel == "1080x1920":
+            w, h = 1080, 1920
+            poster_path = out_dir / f"{base}_VERTICAL_POSTER.png"
+            bg_dir = ASSETS_BG_DIR
+        else:
+            w, h = 1920, 1080
+            poster_path = out_dir / f"{base}_HORIZONTAL_POSTER.png"
+            bg_dir = ASSETS_BG_H_DIR
+
+        # Resolve emotion background (with fallback across cases and, for H, fallback to V set)
+        emotion_key = (self.var_emotion.get() or "").strip()
+        emotion_up = emotion_key.upper().replace(" ", "_")
+        emotion_lc = emotion_key.lower().replace(" ", "_")
+
+        candidates = [
+            bg_dir / f"{emotion_up}.png",
+            bg_dir / f"{emotion_lc}.png",
+        ]
+        if size_sel != "1080x1920":
+            candidates += [
+                ASSETS_BG_DIR / f"{emotion_up}.png",
+                ASSETS_BG_DIR / f"{emotion_lc}.png",
+            ]
+        bg_png = next((p for p in candidates if p.exists()), None)
+        if bg_png and bg_png.exists():
+            self._log(f"[poster-bg] Using background: {bg_png}\n")
+        else:
+            self._log("[poster-bg] No matching background found; falling back to solid color.\n")
+            bg_png = None
+
+        # Use UI font size; clamp
+        try:
+            fs = int(self.var_font_size.get() or 120)
+        except Exception:
+            fs = 120
+        fs = max(40, min(260, fs))
+
+        # Call the dedicated Bash poster script (ASS-based) to avoid Windows filter escaping issues
+        bash_exe = _detect_git_bash_path()
+        poster_sh = TOOLS_DIR / "make_title_poster.sh"
+        if not poster_sh.exists():
+            messagebox.showerror("Missing script", f"make_title_poster.sh not found:\n{poster_sh}")
+            return
+
+        env = os.environ.copy()
+        env["TOP_BANNER"] = title          # poster SHOULD show the title
+        env["FONT_SIZE"] = str(fs)
+        env["MARGIN_L"] = "160"
+        env["MARGIN_R"] = "160"
+        env["MARGIN_V"] = "0"
+        if bg_png:
+            env["BG_PNG"] = str(bg_png)    # script composites over this background
+
+        size_arg = f"--size={w}x{h}"
+        cmd = [bash_exe, str(poster_sh), size_arg, str(poster_path)]
+
+        self._log(f"[poster] {' '.join(cmd)}\n")
+        try:
+            create_flags = 0
+            if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                create_flags = subprocess.CREATE_NO_WINDOW
+            p = subprocess.run(cmd, cwd=str(APP_ROOT), env=env, capture_output=True, text=True, creationflags=create_flags)
+            self._log(p.stdout or "")
+            if p.returncode != 0:
+                self._log(p.stderr or "")
+                messagebox.showerror("Poster error", f"Poster script failed (rc={p.returncode}). See logs.")
+                return
+        except Exception as e:
+            messagebox.showerror("Poster error", str(e)); return
+
+        self._log(f"[OK] Poster written: {poster_path}\n")
+        try:
+            if os.name == "nt":
+                os.startfile(str(poster_path))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def on_stop(self):
         if self.proc and self.proc.poll() is None:

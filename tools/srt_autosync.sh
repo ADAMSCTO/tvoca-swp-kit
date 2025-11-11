@@ -7,6 +7,7 @@ SRT_IN="${1:?need SRT input}"
 WAV_IN="${2:?need WAV input}"
 SRT_OUT="${3:?need SRT output}"
 LEAD_MS="${4:-150}"
+EXTRA_SHIFT_MS="${5:-0}"
 
 # --- functions ---
 to_ms(){ awk -v t="$1" 'BEGIN{printf "%.0f", t*1000}' ; }

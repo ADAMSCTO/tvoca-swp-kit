@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # JirehFaith SWP Kit — Single-Screen Launcher (Brand)
-# Flow: Text input/JSON → WAV (piper w/ profile) → SRT → Captioned MP4
-# Horizontal and Vertical both pass .srt to the renderer (renderer handles autosync→ass→normalize→repair→burn).
-# Hooks UI removed; Open-Title is the only overlay control (POSTER ONLY).
+# Flow:
+#   UI text/JSON → WAV (piper profile) → SRT →
+#   render_swp_unified.sh (ASS normalize/repair + CenterBox → burn)
+#
+# Modes:
+#  A) Autosync mode (default): json_to_srt → unified renderer with AUTOSYNC/TEMPO_MATCH/ONSET on.
+#  B) Sentence-locked mode (new): build SRT from input lines via make_sentence_even_srt.sh,
+#     then render with AUTOSYNC=0 TEMPO_MATCH=0 AUTO_ONSET_ALIGN=0 APPLY_SHIFT_TO_AUDIO=0.
+#
 # Poster button uses Open-Title + Font size + Output Size + Emotion BG.
-# IMPORTANT: For video renders we now FORCE TOP_BANNER='' (no title over captions).
+# IMPORTANT: For video renders we FORCE TOP_BANNER='' (no title over captions).
 
 import json
 import os
@@ -16,7 +22,6 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import textwrap
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = APP_ROOT / "tools"
@@ -27,14 +32,13 @@ OUT_DEFAULT = APP_ROOT / "out"
 VOICE_BUILD_DIR = APP_ROOT / "voice" / "build"
 VOICE_WAVS_DIR = APP_ROOT / "voice" / "wavs"
 VOICE_PROFILES_DIR = APP_ROOT / "voice" / "profiles"
+VOICE_SCRIPT_DIR = APP_ROOT / "voice" / "script"   # for sentence-locked input lines
+
 PIPER_EXE = APP_ROOT / "piper" / "piper.exe"
-MAKE_BOXED = TOOLS_DIR / "make_vertical_boxed.sh"        # vertical renderer
-RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"     # horizontal/also-works-unified
+MAKE_POSTER = TOOLS_DIR / "make_title_poster.sh"
+RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"
+MAKE_SENTENCE_EVEN = TOOLS_DIR / "make_sentence_even_srt.sh"
 
-# Hooks fully retired in UI layer
-SRT_RULES_PATH = None  # retired
-
-# Prefer the updated UI-safe SRT builder if present; fallback to legacy frozen one.
 def _resolve_json_to_srt() -> Path:
     candidates = [
         APP_ROOT / "tools" / "json_to_srt.py",    # preferred
@@ -103,10 +107,7 @@ def norm_path_for_bash(p: Path) -> str:
     return s
 
 def msys_to_win(path_str: str) -> str:
-    """
-    Convert MSYS/Cygwin style like /c/Users/... -> C:\\Users\\...
-    Leave normal Windows paths unchanged.
-    """
+    """Convert /c/... to C:\\...; leave Win paths unchanged."""
     if not path_str:
         return path_str
     s = path_str.strip()
@@ -124,6 +125,7 @@ def ensure_dirs():
     OUT_DEFAULT.mkdir(parents=True, exist_ok=True)
     VOICE_BUILD_DIR.mkdir(parents=True, exist_ok=True)
     VOICE_WAVS_DIR.mkdir(parents=True, exist_ok=True)
+    VOICE_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_profile_env(path: Path) -> dict:
     needed = {"MODEL_PATH", "CONFIG_PATH", "LENGTH_SCALE", "NOISE_SCALE", "NOISE_W"}
@@ -166,38 +168,13 @@ def write_tmp_json_from_text(emotion: str, lang: str, voice: str, text: str, bas
     tmp_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return tmp_json
 
-def _bash_literal(s: str) -> str:
-    """Return a bash-safe single-quoted literal for env assignment."""
-    if s is None:
-        return "''"
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-def _default_fontfile() -> str | None:
-    candidates = [
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\Arial.ttf",
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-def _ffmpeg_path() -> str:
-    return shutil.which("ffmpeg") or "ffmpeg"
-
-def _ff_filter_path(p: Path | str) -> str:
-    s = str(p).replace("\\", "/")
-    if len(s) >= 2 and s[1] == ":":
-        s = s[0] + r"\:" + s[2:]
-    return s
-
 # -------- UI --------
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("JirehFaith SWP Kit — Launcher")
-        self.geometry("1060x900")
-        self.minsize(980, 760)
+        self.geometry("1120x980")
+        self.minsize(1020, 820)
         self.configure(bg=JF_BG)
 
         ensure_dirs()
@@ -207,14 +184,18 @@ class Launcher(tk.Tk):
         self.var_emotion = tk.StringVar(value=EMOTIONS[0])
         self.var_lang = tk.StringVar(value=LANGS[0])
         self.var_size = tk.StringVar(value="1080x1920")   # Default = Shorts (vertical)
-        self.var_font_size = tk.IntVar(value=120)         # UI-controlled caption/poster font size
+        self.var_font_size = tk.IntVar(value=120)         # caption/poster font size
+        self.var_caption_shift = tk.IntVar(value=-500)    # captions lead audio (ms); negative = earlier
         self.var_verse = tk.StringVar(value="")
         self.var_json_path = tk.StringVar(value="")
         self.var_out_dir = tk.StringVar(value=str(OUT_DEFAULT))
         self.var_title = tk.StringVar(value="anxiety_en_amy")
         self.var_auto_title = tk.BooleanVar(value=True)
-        # Open-Title overlay (POSTER ONLY; not used for video renders)
-        self.var_open_title = tk.StringVar(value="")
+        self.var_open_title = tk.StringVar(value="")      # Poster only
+        # New: Sentence-locked mode + pacing controls
+        self.var_sentence_locked = tk.BooleanVar(value=False)
+        self.var_gap_ms = tk.IntVar(value=180)            # GAP_MS for sentence SRT builder
+        self.var_min_ms = tk.IntVar(value=1000)           # MIN_MS for sentence SRT builder
 
         for v in (self.var_voice, self.var_emotion, self.var_lang):
             v.trace_add("write", lambda *_: self._maybe_auto_title())
@@ -271,6 +252,12 @@ class Launcher(tk.Tk):
         self._entry(row1, self.var_font_size, 4).pack(side="left", padx=(4,0))
         tk.Button(row1, text="A+", command=lambda: self._font_bump(+6), width=3, bg="#ffffff").pack(side="left", padx=(4,0))
 
+        # Caption lead (ms) + nudge buttons
+        self._lbl(row1, "Lead(ms):").pack(side="left", padx=(10,0))
+        tk.Button(row1, text="–50", command=lambda: self._lead_bump(-50), width=4, bg="#ffffff").pack(side="left", padx=(4,0))
+        self._entry(row1, self.var_caption_shift, 6).pack(side="left", padx=(4,0))
+        tk.Button(row1, text="+50", command=lambda: self._lead_bump(+50), width=4, bg="#ffffff").pack(side="left", padx=(4,10))
+
         # Row 2
         row2 = tk.Frame(frm, bg="white"); row2.pack(fill="x", pady=(2, 6))
         self._lbl(row2, "Verse tag (optional):").pack(side="left")
@@ -300,7 +287,19 @@ class Launcher(tk.Tk):
         self._lbl(row4, "Open-title (for Poster only):").pack(side="left")
         self._entry(row4, self.var_open_title, 46).pack(side="left", padx=(6, 20))
 
-        # Middle
+        # Row 5 — Sentence-locked controls
+        row5 = tk.Frame(frm, bg="white"); row5.pack(fill="x", pady=(2, 6))
+        tk.Checkbutton(
+            row5, text="Sentence-locked (use input lines as cues — disables autosync)",
+            variable=self.var_sentence_locked, bg="white", fg=JF_TEXT,
+            activebackground="white", selectcolor=JF_BG
+        ).pack(side="left")
+        self._lbl(row5, "Gap(ms):").pack(side="left", padx=(18,0))
+        self._entry(row5, self.var_gap_ms, 6).pack(side="left", padx=(6,12))
+        self._lbl(row5, "Min(ms):").pack(side="left", padx=(0,0))
+        self._entry(row5, self.var_min_ms, 6).pack(side="left", padx=(6,0))
+
+        # Middle — Text area
         mid = tk.LabelFrame(card, text="Prayer text (one line per caption; used if no JSON is selected)", bg="white", fg=JF_TEXT, labelanchor="nw")
         mid.configure(highlightbackground="#efeaf7", highlightthickness=1)
         mid.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
@@ -362,8 +361,16 @@ class Launcher(tk.Tk):
             v = int(self.var_font_size.get())
         except Exception:
             v = 120
-        v = max(40, min(240, v + delta))  # clamp to sane range
+        v = max(40, min(240, v + delta))
         self.var_font_size.set(v)
+
+    def _lead_bump(self, delta: int):
+        try:
+            v = int(self.var_caption_shift.get())
+        except Exception:
+            v = -500
+        v = max(-5000, min(5000, v + delta))
+        self.var_caption_shift.set(v)
 
     # --- clipboard ---
     def clear_input(self):
@@ -434,25 +441,23 @@ class Launcher(tk.Tk):
             messagebox.showwarning("Busy", "A build is already running. Stop it first or wait for it to finish.")
             return
 
-        # Preflight files
-        if not PIPER_EXE.exists():
-            messagebox.showerror("Missing Piper", f"piper.exe not found:\n{PIPER_EXE}")
-            return
-        if not JSON_TO_SRT.exists():
-            messagebox.showerror("Missing script", f"json_to_srt.py not found:\n{JSON_TO_SRT}")
+        # Preflight (local binaries/scripts)
+        missing = []
+        for p in [PIPER_EXE, JSON_TO_SRT, RENDER_UNIFIED]:
+            if not p.exists():
+                missing.append(str(p))
+        if self.var_sentence_locked.get() and not MAKE_SENTENCE_EVEN.exists():
+            missing.append(str(MAKE_SENTENCE_EVEN))
+        if missing:
+            messagebox.showerror("Missing files", "These required files were not found:\n- " + "\n- ".join(missing))
             return
 
         size_sel = (self.var_size.get() or "1080x1920").strip()
-        if size_sel == "1080x1920":
-            if not MAKE_BOXED.exists():
-                messagebox.showerror("Missing script", f"make_vertical_boxed.sh not found:\n{MAKE_BOXED}")
-                return
-        else:
-            if not RENDER_UNIFIED.exists():
-                messagebox.showerror("Missing script", f"render_swp_unified.sh not found:\n{RENDER_UNIFIED}")
-                return
+        if size_sel not in ("1080x1920", "1920x1080"):
+            messagebox.showerror("Size error", f"Unsupported size selection: {size_sel}")
+            return
 
-        # JSON
+        # JSON (or build temporary JSON from textarea)
         json_src = self.var_json_path.get().strip()
         if json_src:
             json_path = Path(json_src)
@@ -473,20 +478,14 @@ class Launcher(tk.Tk):
 
         # OUT base/paths
         out_dir = Path(self.var_out_dir.get().strip() or OUT_DEFAULT); out_dir.mkdir(parents=True, exist_ok=True)
-        base = self.var_title.get().strip()
-        if not base:
-            base = f"{self.var_emotion.get().lower()}_{self.var_lang.get().lower()}_{self.var_voice.get().lower()}"
-            self.var_title.set(base)
+        base = self.var_title.get().strip() or f"{self.var_emotion.get().lower()}_{self.var_lang.get().lower()}_{self.var_voice.get().lower()}"
+        self.var_title.set(base)
 
         wav_path = VOICE_WAVS_DIR / f"{base}.wav"
-        srt_path = VOICE_BUILD_DIR / f"{base}.srt"
+        srt_path = VOICE_BUILD_DIR / f"{base}.srt"  # default path; may be overwritten by sentence-locked builder
 
         # Output file name depends on size
-        size_sel = (self.var_size.get() or "1080x1920").strip()
-        if size_sel == "1080x1920":
-            out_mp4 = out_dir / f"{base}_VERTICAL_BOXED.mp4"
-        else:
-            out_mp4 = out_dir / f"{base}_HORIZONTAL_1080p.mp4"
+        out_mp4 = out_dir / (f"{base}_VERTICAL_BOXED.mp4" if size_sel == "1080x1920" else f"{base}_HORIZONTAL_1080p.mp4")
 
         # Background selection (format-aware, with fallback)
         emotion_key = (self.var_emotion.get() or "").strip()
@@ -521,7 +520,7 @@ class Launcher(tk.Tk):
         except Exception as e:
             messagebox.showerror("Profile error", str(e)); return
 
-        # 1) WAV (Piper with profile)
+        # 1) WAV via Piper (from JSON)
         try:
             text_for_tts = build_text_from_json(json_path)
         except Exception as e:
@@ -557,78 +556,131 @@ class Launcher(tk.Tk):
         except Exception as e:
             messagebox.showerror("Piper launch error", str(e)); return
 
-        # 2) SRT from JSON (ensure console python, not pythonw)
-        self._log(f"[srt] {JSON_TO_SRT} → {srt_path}\n")
-        try:
-            py = sys.executable.replace("pythonw.exe", "python.exe")
-            p2 = subprocess.run(
-                [py, str(JSON_TO_SRT), "--input", str(json_path), "--out", str(srt_path)],
-                cwd=str(APP_ROOT),
-                capture_output=True,
-                text=True
-            )
-            self._log(p2.stdout or "")
-            if p2.returncode != 0:
-                self._log(p2.stderr or "")
-                messagebox.showerror("SRT error", f"json_to_srt failed (rc={p2.returncode}). See logs.")
-                return
-        except Exception as e:
-            messagebox.showerror("SRT step error", str(e)); return
-
-        # Normalize SRT newlines so libass sees cues
-        try:
-            raw = Path(srt_path).read_text(encoding="utf-8")
-            fixed = raw.replace("\r\n", "\n").replace("\\n", "\n")
-            Path(srt_path).write_text(fixed, encoding="utf-8", newline="\n")
-            self._log(f"[normalize] fixed newlines {srt_path}\n")
-        except Exception as e:
-            self._log(f"[warn] normalize failed: {e}\n")
-
-        # Captions: both V and H pass SRT to renderer
-        cap_for_vertical = srt_path
-        cap_for_horizontal = srt_path
-
-        # 3) Render MP4
+        # 2) Build SRT
+        sentence_locked = self.var_sentence_locked.get()
         bash_path = _detect_git_bash_path()
 
-        # Shared paths → bash form
+        if sentence_locked:
+            # Save textarea lines to voice/script/<base>.txt and call make_sentence_even_srt.sh
+            lines_text = self.txt.get("1.0", "end").strip()
+            if not lines_text:
+                messagebox.showerror("No lines", "Sentence-locked mode requires lines in the Prayer text box.")
+                return
+            script_txt = VOICE_SCRIPT_DIR / f"{base}.txt"
+            script_txt.write_text(lines_text + "\n", encoding="utf-8")
+            self._log(f"[script] Wrote lines: {script_txt}\n")
+
+            try:
+                gap = int(self.var_gap_ms.get())
+            except Exception:
+                gap = 180
+            try:
+                min_ms = int(self.var_min_ms.get())
+            except Exception:
+                min_ms = 1000
+
+            # Output SRT path (fixed)
+            srt_path = VOICE_BUILD_DIR / f"{base}.sentences.srt"
+
+            env2 = os.environ.copy()
+            env2["GAP_MS"] = str(gap)
+            env2["MIN_MS"] = str(min_ms)
+
+            b_wav  = norm_path_for_bash(wav_path)
+            b_txt  = norm_path_for_bash(script_txt)
+            b_srt  = norm_path_for_bash(srt_path)
+
+            cmd_s = f'"{norm_path_for_bash(MAKE_SENTENCE_EVEN)}" "{b_wav}" "{b_txt}" "{b_srt}"'
+            self._log(f"[srt-sentences] GAP_MS={gap} MIN_MS={min_ms} → {srt_path}\n")
+            try:
+                p2 = subprocess.run([bash_path, "-lc", cmd_s], cwd=str(APP_ROOT), env=env2, capture_output=True, text=True)
+                self._log(p2.stdout or "")
+                if p2.returncode != 0:
+                    self._log(p2.stderr or "")
+                    messagebox.showerror("Sentence SRT error", f"make_sentence_even_srt.sh failed (rc={p2.returncode}). See logs.")
+                    return
+            except Exception as e:
+                messagebox.showerror("Sentence SRT launch error", str(e)); return
+        else:
+            # json_to_srt (UI-safe)
+            srt_path = VOICE_BUILD_DIR / f"{base}.srt"
+            self._log(f"[srt] {JSON_TO_SRT} → {srt_path}\n")
+            try:
+                py = sys.executable.replace("pythonw.exe", "python.exe")
+                p2 = subprocess.run(
+                    [py, str(JSON_TO_SRT), "--input", str(json_path), "--out", str(srt_path)],
+                    cwd=str(APP_ROOT),
+                    capture_output=True,
+                    text=True
+                )
+                self._log(p2.stdout or "")
+                if p2.returncode != 0:
+                    self._log(p2.stderr or "")
+                    messagebox.showerror("SRT error", f"json_to_srt failed (rc={p2.returncode}). See logs.")
+                    return
+            except Exception as e:
+                messagebox.showerror("SRT step error", str(e)); return
+
+            # Normalize SRT newlines so libass sees cues
+            try:
+                raw = Path(srt_path).read_text(encoding="utf-8")
+                fixed = raw.replace("\r\n", "\n").replace("\\n", "\n")
+                Path(srt_path).write_text(fixed, encoding="utf-8", newline="\n")
+                self._log(f"[normalize] fixed newlines {srt_path}\n")
+            except Exception as e:
+                self._log(f"[warn] normalize failed: {e}\n")
+
+        # 3) Render MP4 with unified renderer
+        # Paths → bash form
         b_bg   = norm_path_for_bash(bg_png)
         b_wav  = norm_path_for_bash(wav_path)
+        b_srt  = norm_path_for_bash(srt_path)
         b_out  = norm_path_for_bash(out_mp4)
 
-        # capture requested font size
+        # Font size
         try:
             fs = int(self.var_font_size.get() or 120)
         except Exception:
             fs = 120
 
-        # For video renders we FORCE no title overlay:
-        top_banner_literal = "''"  # <- this is the fix: pass empty to renderers
+        # Caption lead (maps to CAPTION_SHIFT_MS; still honored in sentence-locked)
+        try:
+            lead = int(self.var_caption_shift.get())
+        except Exception:
+            lead = -500
 
-        size_sel = (self.var_size.get() or "1080x1920").strip()
-        if size_sel == "1080x1920":
-            b_make = norm_path_for_bash(MAKE_BOXED)
-            b_cap  = norm_path_for_bash(cap_for_vertical)
-            self._log(f"[cap] Vertical captions (SRT): {cap_for_vertical}\n")
-            env_kv = f"LEAD_MS=200 FONT_SIZE={fs} MARGIN_L=160 MARGIN_R=160 MARGIN_V=0 TOP_BANNER={top_banner_literal}"
-            cmd = f'{env_kv} {b_make} "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
+        env = os.environ.copy()
+        env["FONT_SIZE"] = str(fs)
+        env["CAPTION_SHIFT_MS"] = str(lead)
+        env["TOP_BANNER"] = ""  # ensure no in-video title
+
+        if sentence_locked:
+            # Hard-off all autosync/tempo/onset adjustments
+            env["AUTOSYNC"] = "0"
+            env["TEMPO_MATCH"] = "0"
+            env["AUTO_ONSET_ALIGN"] = "0"
+            env["APPLY_SHIFT_TO_AUDIO"] = "0"
         else:
-            b_unified = norm_path_for_bash(RENDER_UNIFIED)
-            b_cap     = norm_path_for_bash(cap_for_horizontal)
-            self._log(f"[cap] Horizontal captions (SRT): {cap_for_horizontal}\n")
-            env_kv = f'FONT_SIZE={fs} TOP_BANNER={top_banner_literal} BOTTOM_TEXT="" CAPTION_SHIFT_MS=0'
-            cmd = f'{env_kv} {b_unified} --size=1920x1080 "{b_bg}" "{b_wav}" "{b_cap}" "{b_out}"'
+            # Standard smart pipeline defaults
+            env["AUTOSYNC"] = "1"
+            env["TEMPO_MATCH"] = "1"
+            env["AUTO_ONSET_ALIGN"] = "1"
+            env["APPLY_SHIFT_TO_AUDIO"] = "1"
 
+        size_arg = f"--size={size_sel}"
+        cmd = f'"{norm_path_for_bash(RENDER_UNIFIED)}" {size_arg} "{b_bg}" "{b_wav}" "{b_srt}" "{b_out}"'
         self._log(f"[render] {cmd}\n")
+
         try:
             self._stop_reader.clear()
             self.proc = subprocess.Popen(
-                [bash_path, "-lc", cmd],
+                [_detect_git_bash_path(), "-lc", cmd],
                 cwd=str(APP_ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 bufsize=1,
+                env=env
             )
         except Exception as e:
             messagebox.showerror("Render launch error", str(e))
@@ -685,11 +737,9 @@ class Launcher(tk.Tk):
             fs = 120
         fs = max(40, min(260, fs))
 
-        # Call the dedicated Bash poster script (ASS-based) to avoid Windows filter escaping issues
         bash_exe = _detect_git_bash_path()
-        poster_sh = TOOLS_DIR / "make_title_poster.sh"
-        if not poster_sh.exists():
-            messagebox.showerror("Missing script", f"make_title_poster.sh not found:\n{poster_sh}")
+        if not MAKE_POSTER.exists():
+            messagebox.showerror("Missing script", f"make_title_poster.sh not found:\n{MAKE_POSTER}")
             return
 
         env = os.environ.copy()
@@ -702,7 +752,7 @@ class Launcher(tk.Tk):
             env["BG_PNG"] = str(bg_png)    # script composites over this background
 
         size_arg = f"--size={w}x{h}"
-        cmd = [bash_exe, str(poster_sh), size_arg, str(poster_path)]
+        cmd = [bash_exe, str(MAKE_POSTER), size_arg, str(poster_path)]
 
         self._log(f"[poster] {' '.join(cmd)}\n")
         try:
@@ -756,8 +806,9 @@ class Launcher(tk.Tk):
         self.log.configure(state="normal"); self.log.insert("end", text); self.log.see("end"); self.log.configure(state="disabled")
 
 def main():
+    # Minimal preflight for local binaries/scripts
     missing = []
-    for p in [PIPER_EXE, JSON_TO_SRT, MAKE_BOXED]:
+    for p in [PIPER_EXE, JSON_TO_SRT, RENDER_UNIFIED]:
         if not p.exists():
             missing.append(str(p))
     if missing:

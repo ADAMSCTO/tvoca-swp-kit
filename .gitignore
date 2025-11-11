@@ -13,13 +13,24 @@ __pycache__/
 # === Build & cache dirs ===
 /out/
 /ship/
+/tmp/
 
 # === Voice artifacts ===
 /voice/wavs/
 
-# Generated timing/sync files (keep original .srt you authored)
+# Generated timing/sync files (keep only hand-authored .srt in /voice/script if you ever want to track them)
+# UI/auto builders + autosync outputs
 /voice/build/*.autosync.srt
 /voice/build/*.autosync.ass
+/voice/build/*.ui_tmp.json
+/voice/build/*.pass2.srt
+/voice/build/*.sentences.srt
+/voice/build/*.lf.srt
+/voice/build/.*.lf.srt
+/voice/build/.*/        # any hidden build work dirs
+
+# Text scripts created from the UI (not hand-authored), ignore by default
+/voice/script/*.txt
 
 # Other compiled captions we don't author by hand
 *.ass
@@ -33,6 +44,11 @@ voice/build/*.ass        # but ignore build ASS specifically
 *.aac
 *.wav
 !.keep                    # allow marker files
+
+# Tools/backups left by edits
+tools/*.bak
+tools/*.bak.*
+tools/*~ 
 
 # Node/npm if it ever shows up
 node_modules/

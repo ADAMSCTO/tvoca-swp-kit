@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unified renderer for SWP videos (H & V) with enforced CenterBox style.
-# SRT path: autosync (pass1) → optional tempo-match voice → autosync (pass2) → ASS → normalize → repair → optional gate → burn.
-# ASS path: normalize → repair → optional gate → burn.
+# SRT path: autosync (pass1) → optional tempo-match voice → autosync (pass2) → ASS → normalize → repair → CenterBox-enforce → optional gate → burn.
+# ASS path: normalize → repair → CenterBox-enforce → optional gate → burn.
 #
 # Core anti “captions-ahead” strategy:
 # 1) Keep captions aligned to audio analytically (autosync + onset).
@@ -215,6 +215,12 @@ ASS_NORM="$BUILD/$(basename "${ASS_RAW%.*}").norm.ass"; to_lf_file "$ASS_RAW" "$
 run_hooks pre_ass_normalize || true; normalize_ass "$ASS_NORM" || true
 ASS_REPAIRED="$BUILD/$(basename "${ASS_RAW%.*}").repaired.ass"; repair_bad_ts "$ASS_NORM" "$ASS_REPAIRED"
 
+# --- Enforce CenterBox-only overrides (strip {\anX}, {\pos()}, {\move()}) ----
+ASS_CENTERBOX="$BUILD/$(basename "${ASS_RAW%.*}").centerbox.ass"
+bash "$TOOLS/ass_force_centerbox.sh" "$ASS_REPAIRED" "$ASS_CENTERBOX"
+ASS_REPAIRED="$ASS_CENTERBOX"
+log_i "Enforced CenterBox ASS: $(cygpath -w "$ASS_REPAIRED")"
+
 # --- Apply manual shift only if explicitly set -------------------------------
 if [[ -n "${CAPTION_SHIFT_MS:-}" && "${CAPTION_SHIFT_MS}" != "0" ]]; then
   ASS_SHIFTED="$BUILD/$(basename "${ASS_RAW%.*}").shifted.ass"
@@ -225,7 +231,7 @@ fi
 
 DCOUNT="$(count_dialogue "$ASS_REPAIRED")"
 if [[ "${DCOUNT:-0}" -le 0 ]]; then
-  log_e "After repair, no Dialogue events remain in: $(cygpath -w "$ASS_REPAIRED")"
+  log_e "After repair/CenterBox, no Dialogue events remain in: $(cygpath -w "$ASS_REPAIRED")"
   exit 7
 fi
 
@@ -315,9 +321,13 @@ esac
 
 # --- Build VF chain ----------------------------------------------------------
 VF="${BGVF}"
-if [[ -n "$BASS_ESC" ]]; then VF="${VF},ass=filename='${BASS_ESC}':original_size=${PRX}x${PRY}"; fi
+if [[ -n "$BASS_ESC" ]]; then
+  VF="${VF},ass=filename='${BASS_ESC}':original_size=${PRX}x${PRY}"
+fi
 VF="${VF},ass=filename='${ASS_ESC}':original_size=${PRX}x${PRY}"
-if [[ -n "${EXTRA_ASS_FILTER:-}" ]]; then VF="${VF}${EXTRA_ASS_FILTER}"; fi
+if [[ -n "${EXTRA_ASS_FILTER:-}" ]]; then
+  VF="${VF}${EXTRA_ASS_FILTER}"
+fi
 
 export INPUT_WAV="$WAV" INPUT_SRT="${SRT_IN:-}" INPUT_ASS="$ASS_REPAIRED"
 run_hooks pre_burn || true

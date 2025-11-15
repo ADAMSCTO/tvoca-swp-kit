@@ -6,8 +6,9 @@
 #
 # Modes:
 #  A) Autosync mode (default): json_to_srt → unified renderer with AUTOSYNC/TEMPO_MATCH/ONSET on.
-#  B) Sentence-locked mode (new): build SRT from input lines via make_sentence_even_srt.sh,
-#     then render with AUTOSYNC=0 TEMPO_MATCH=0 AUTO_ONSET_ALIGN=0 APPLY_SHIFT_TO_AUDIO=0.
+#  B) Sentence-locked mode (audio-driven): one TTS clip per input line, SRT built from real clip
+#     durations, then clips concatenated into final WAV; AUTOSYNC=0 TEMPO_MATCH=0 AUTO_ONSET_ALIGN=0
+#     APPLY_SHIFT_TO_AUDIO=0. Each line = one sentence/frame.
 #
 # Poster button uses Open-Title + Font size + Output Size + Emotion BG.
 # IMPORTANT: For video renders we FORCE TOP_BANNER='' (no title over captions).
@@ -37,7 +38,6 @@ VOICE_SCRIPT_DIR = APP_ROOT / "voice" / "script"   # for sentence-locked input l
 PIPER_EXE = APP_ROOT / "piper" / "piper.exe"
 MAKE_POSTER = TOOLS_DIR / "make_title_poster.sh"
 RENDER_UNIFIED = TOOLS_DIR / "render_swp_unified.sh"
-MAKE_SENTENCE_EVEN = TOOLS_DIR / "make_sentence_even_srt.sh"
 
 def _resolve_json_to_srt() -> Path:
     candidates = [
@@ -61,17 +61,22 @@ JF_TEXT   = "#1a1a1a"
 EMOTIONS = [
     "ANGER", "ANXIETY", "DESPAIR", "FEAR", "FINANCIAL_TRIALS",
     "GRIEF", "HOPE", "ILLNESS", "JOY", "LOVE",
-    "PERSEVERANCE", "RELATIONSHIP_TRIALS", "PEACE", "SUCCESS", "PROTECTION"
+    "PERSEVERANCE", "RELATIONSHIP_TRIALS", "PEACE", "SUCCESS", "PROTECTION",
+    "TRAVEL",
 ]
 
-# Voices (anchored trio)
-VOICE_LABELS = ["AMY", "BRYCE", "RYAN"]
+# Voices
+VOICE_LABELS = ["AMY", "BRYCE", "RYAN", "JOE", "NORMAN", "RYAN_HIGH", "LIBRITTS"]
 LANGS = ["EN", "ES", "FR", "PT"]
 
 PROFILE_MAP = {
-    "AMY":   VOICE_PROFILES_DIR / "female-default.env",
-    "BRYCE": VOICE_PROFILES_DIR / "male-default.env",
-    "RYAN":  VOICE_PROFILES_DIR / "male-ryan.env",
+    "AMY":       VOICE_PROFILES_DIR / "female-default.env",
+    "BRYCE":     VOICE_PROFILES_DIR / "male-default.env",
+    "RYAN":      VOICE_PROFILES_DIR / "male-ryan.env",
+    "JOE":       VOICE_PROFILES_DIR / "male-joe.env",
+    "NORMAN":    VOICE_PROFILES_DIR / "male-norman.env",
+    "RYAN_HIGH": VOICE_PROFILES_DIR / "male-ryan-high.env",
+    "LIBRITTS":  VOICE_PROFILES_DIR / "male-libritts.env",
 }
 
 def _detect_git_bash_path() -> str:
@@ -192,10 +197,10 @@ class Launcher(tk.Tk):
         self.var_title = tk.StringVar(value="anxiety_en_amy")
         self.var_auto_title = tk.BooleanVar(value=True)
         self.var_open_title = tk.StringVar(value="")      # Poster only
-        # New: Sentence-locked mode + pacing controls
+        # Sentence-locked mode (audio-driven) — pacing sliders kept for future tuning if needed
         self.var_sentence_locked = tk.BooleanVar(value=False)
-        self.var_gap_ms = tk.IntVar(value=180)            # GAP_MS for sentence SRT builder
-        self.var_min_ms = tk.IntVar(value=1000)           # MIN_MS for sentence SRT builder
+        self.var_gap_ms = tk.IntVar(value=180)            # kept for UI; not used in audio-driven mode
+        self.var_min_ms = tk.IntVar(value=1000)           # kept for UI; not used in audio-driven mode
 
         for v in (self.var_voice, self.var_emotion, self.var_lang):
             v.trace_add("write", lambda *_: self._maybe_auto_title())
@@ -282,10 +287,11 @@ class Launcher(tk.Tk):
         self._lbl(row3, "Output base name:").pack(side="left")
         self._entry(row3, self.var_title, 40).pack(side="left", padx=(6, 20))
 
-        # Row 4 — Open-Title (POSTER ONLY)
+        # Row 4 — Open-Title (POSTER ONLY) + Poster button
         row4 = tk.Frame(frm, bg="white"); row4.pack(fill="x", pady=(2, 6))
         self._lbl(row4, "Open-title (for Poster only):").pack(side="left")
-        self._entry(row4, self.var_open_title, 46).pack(side="left", padx=(6, 20))
+        self._entry(row4, self.var_open_title, 46).pack(side="left", padx=(6, 10))
+        self._btn(row4, "Make Poster", self.on_make_poster).pack(side="left", padx=(4, 0))
 
         # Row 5 — Sentence-locked controls
         row5 = tk.Frame(frm, bg="white"); row5.pack(fill="x", pady=(2, 6))
@@ -323,8 +329,6 @@ class Launcher(tk.Tk):
         self.btn_start = self._btn(bot, "Start", self.on_start, primary=True); self.btn_start.pack(side="left")
         self._btn(bot, "Open Output Folder", self.open_out_dir).pack(side="left", padx=6)
         self._btn(bot, "Stop", self.on_stop, danger=True).pack(side="left", padx=6)
-        # Poster generator
-        self._btn(bot, "Make Poster (from Open-Title)", self.on_make_poster).pack(side="left", padx=12)
 
         # Logs
         log_frame = tk.LabelFrame(card, text="Build logs (streamed)", bg="white", fg=JF_TEXT, labelanchor="nw")
@@ -446,8 +450,6 @@ class Launcher(tk.Tk):
         for p in [PIPER_EXE, JSON_TO_SRT, RENDER_UNIFIED]:
             if not p.exists():
                 missing.append(str(p))
-        if self.var_sentence_locked.get() and not MAKE_SENTENCE_EVEN.exists():
-            missing.append(str(MAKE_SENTENCE_EVEN))
         if missing:
             messagebox.showerror("Missing files", "These required files were not found:\n- " + "\n- ".join(missing))
             return
@@ -520,88 +522,204 @@ class Launcher(tk.Tk):
         except Exception as e:
             messagebox.showerror("Profile error", str(e)); return
 
-        # 1) WAV via Piper (from JSON)
-        try:
-            text_for_tts = build_text_from_json(json_path)
-        except Exception as e:
-            messagebox.showerror("JSON parse error", f"Could not read lines from JSON:\n{e}")
-            return
-
-        self._log(f"[tts] {voice_label} → {wav_path}\n")
-        try:
-            create_flags = 0
-            if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-                create_flags = subprocess.CREATE_NO_WINDOW
-            p = subprocess.run(
-                [
-                    str(PIPER_EXE),
-                    "--model", prof["MODEL_PATH"],
-                    "--config", prof["CONFIG_PATH"],
-                    "--length_scale", prof["LENGTH_SCALE"],
-                    "--noise_scale", prof["NOISE_SCALE"],
-                    "--noise_w", prof["NOISE_W"],
-                    "--output_file", str(wav_path),
-                ],
-                input=text_for_tts,
-                text=True,
-                cwd=str(APP_ROOT),
-                capture_output=True,
-                creationflags=create_flags,
-            )
-            self._log(p.stdout or "")
-            if p.returncode != 0:
-                self._log(p.stderr or "")
-                messagebox.showerror("Piper error", f"Piper failed (rc={p.returncode}). See logs.")
-                return
-        except Exception as e:
-            messagebox.showerror("Piper launch error", str(e)); return
-
-        # 2) Build SRT
         sentence_locked = self.var_sentence_locked.get()
         bash_path = _detect_git_bash_path()
 
         if sentence_locked:
-            # Save textarea lines to voice/script/<base>.txt and call make_sentence_even_srt.sh
+            # Sentence-locked mode (audio-driven, one clip per line):
+            # 1) Save textarea lines to voice/script/<base>.txt
+            # 2) For each line: TTS → clip WAV (selected profile)
+            # 3) Use ffprobe to measure each clip duration
+            # 4) Build SRT from cumulative durations
+            # 5) Concatenate clips → final wav_path
             lines_text = self.txt.get("1.0", "end").strip()
             if not lines_text:
                 messagebox.showerror("No lines", "Sentence-locked mode requires lines in the Prayer text box.")
                 return
+
             script_txt = VOICE_SCRIPT_DIR / f"{base}.txt"
             script_txt.write_text(lines_text + "\n", encoding="utf-8")
             self._log(f"[script] Wrote lines: {script_txt}\n")
 
-            try:
-                gap = int(self.var_gap_ms.get())
-            except Exception:
-                gap = 180
-            try:
-                min_ms = int(self.var_min_ms.get())
-            except Exception:
-                min_ms = 1000
+            lines = [ln.strip() for ln in lines_text.splitlines() if ln.strip()]
+            if not lines:
+                messagebox.showerror("No lines", "Sentence-locked mode found no non-empty lines.")
+                return
 
-            # Output SRT path (fixed)
+            # Output SRT path and clips dir
             srt_path = VOICE_BUILD_DIR / f"{base}.sentences.srt"
-
-            env2 = os.environ.copy()
-            env2["GAP_MS"] = str(gap)
-            env2["MIN_MS"] = str(min_ms)
-
-            b_wav  = norm_path_for_bash(wav_path)
-            b_txt  = norm_path_for_bash(script_txt)
-            b_srt  = norm_path_for_bash(srt_path)
-
-            cmd_s = f'"{norm_path_for_bash(MAKE_SENTENCE_EVEN)}" "{b_wav}" "{b_txt}" "{b_srt}"'
-            self._log(f"[srt-sentences] GAP_MS={gap} MIN_MS={min_ms} → {srt_path}\n")
+            clips_dir = VOICE_WAVS_DIR / f"{base}_clips"
             try:
-                p2 = subprocess.run([bash_path, "-lc", cmd_s], cwd=str(APP_ROOT), env=env2, capture_output=True, text=True)
-                self._log(p2.stdout or "")
-                if p2.returncode != 0:
-                    self._log(p2.stderr or "")
-                    messagebox.showerror("Sentence SRT error", f"make_sentence_even_srt.sh failed (rc={p2.returncode}). See logs.")
+                clips_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Path error", f"Could not create clips directory:\n{clips_dir}\n{e}")
+                return
+
+            durations = []   # seconds per clip
+            clip_paths = []
+            total_sec = 0.0
+
+            for idx, line in enumerate(lines, start=1):
+                clip_path = clips_dir / f"{base}_clip_{idx:03d}.wav"
+                self._log(f"[tts-sentence] {voice_label} line {idx}: {clip_path}\n")
+                try:
+                    create_flags = 0
+                    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                        create_flags = subprocess.CREATE_NO_WINDOW
+                    p_clip = subprocess.run(
+                        [
+                            str(PIPER_EXE),
+                            "--model", prof["MODEL_PATH"],
+                            "--config", prof["CONFIG_PATH"],
+                            "--length_scale", prof["LENGTH_SCALE"],
+                            "--noise_scale", prof["NOISE_SCALE"],
+                            "--noise_w", prof["NOISE_W"],
+                            "--output_file", str(clip_path),
+                        ],
+                        input=line,
+                        text=True,
+                        cwd=str(APP_ROOT),
+                        capture_output=True,
+                        creationflags=create_flags,
+                    )
+                    self._log(p_clip.stdout or "")
+                    if p_clip.returncode != 0:
+                        self._log(p_clip.stderr or "")
+                        messagebox.showerror("Piper error", f"Piper failed on line {idx} (rc={p_clip.returncode}). See logs.")
+                        return
+                except Exception as e:
+                    messagebox.showerror("Piper launch error", f"Line {idx}: {e}")
+                    return
+
+                # Measure duration of this clip via ffprobe
+                try:
+                    p_probe = subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v", "error",
+                            "-select_streams", "a:0",
+                            "-show_entries", "stream=duration",
+                            "-of", "default=nw=1:nk=1",
+                            str(clip_path),
+                        ],
+                        cwd=str(APP_ROOT),
+                        capture_output=True,
+                        text=True,
+                    )
+                    if p_probe.returncode != 0 or not (p_probe.stdout or "").strip():
+                        self._log(p_probe.stderr or "")
+                        messagebox.showerror("ffprobe error", f"Could not read duration for {clip_path}.")
+                        return
+                    dur_sec = float((p_probe.stdout or "").strip())
+                except Exception as e:
+                    messagebox.showerror("ffprobe error", f"Line {idx}: {e}")
+                    return
+
+                durations.append(dur_sec)
+                clip_paths.append(clip_path)
+                total_sec += dur_sec
+
+            self._log(f"[tts-sentence] Built {len(lines)} clips, total audio ~{total_sec:.2f}s\n")
+
+            # Helper to format seconds as SRT timestamp
+            def _sec_to_srt_time(sec: float) -> str:
+                if sec < 0.0:
+                    sec = 0.0
+                ms = int(round(sec * 1000.0))
+                cs = ms % 1000
+                s = (ms // 1000) % 60
+                m = (ms // 60000) % 60
+                h = ms // 3600000
+                return f"{h:02d}:{m:02d}:{s:02d},{cs:03d}"
+
+            # Build SRT using cumulative durations (audio is the clock)
+            try:
+                cur = 0.0
+                with srt_path.open("w", encoding="utf-8", newline="\n") as f:
+                    for idx, (line, dur) in enumerate(zip(lines, durations), start=1):
+                        start = cur
+                        end = cur + max(0.0, dur)
+                        f.write(f"{idx}\n")
+                        f.write(f"{_sec_to_srt_time(start)} --> {_sec_to_srt_time(end)}\n")
+                        f.write(line.strip() + "\n\n")
+                        cur = end
+                self._log(f"[srt-sentences] Wrote SRT: {srt_path}\n")
+            except Exception as e:
+                messagebox.showerror("SRT error", f"Could not write SRT:\n{e}")
+                return
+
+            # Concatenate all clips into final wav_path
+            concat_list = clips_dir / "concat.txt"
+            try:
+                with concat_list.open("w", encoding="utf-8") as f:
+                    for cp in clip_paths:
+                        f.write(f"file '{str(cp)}'\n")
+
+                create_flags = 0
+                if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    create_flags = subprocess.CREATE_NO_WINDOW
+                p_cat = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", str(concat_list),
+                        "-c", "copy",
+                        str(wav_path),
+                    ],
+                    cwd=str(APP_ROOT),
+                    capture_output=True,
+                    text=True,
+                    creationflags=create_flags,
+                )
+                self._log(p_cat.stdout or "")
+                if p_cat.returncode != 0:
+                    self._log(p_cat.stderr or "")
+                    messagebox.showerror("Concat error", f"ffmpeg concat failed (rc={p_cat.returncode}). See logs.")
+                    return
+                self._log(f"[wav-sentences] Concatenated WAV: {wav_path}\n")
+            except Exception as e:
+                messagebox.showerror("Concat error", str(e))
+                return
+
+        else:
+            # Autosync mode: 1) full WAV via Piper (from JSON), 2) json_to_srt
+            try:
+                text_for_tts = build_text_from_json(json_path)
+            except Exception as e:
+                messagebox.showerror("JSON parse error", f"Could not read lines from JSON:\n{e}")
+                return
+
+            self._log(f"[tts] {voice_label} → {wav_path}\n")
+            try:
+                create_flags = 0
+                if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    create_flags = subprocess.CREATE_NO_WINDOW
+                p = subprocess.run(
+                    [
+                        str(PIPER_EXE),
+                        "--model", prof["MODEL_PATH"],
+                        "--config", prof["CONFIG_PATH"],
+                        "--length_scale", prof["LENGTH_SCALE"],
+                        "--noise_scale", prof["NOISE_SCALE"],
+                        "--noise_w", prof["NOISE_W"],
+                        "--output_file", str(wav_path),
+                    ],
+                    input=text_for_tts,
+                    text=True,
+                    cwd=str(APP_ROOT),
+                    capture_output=True,
+                    creationflags=create_flags,
+                )
+                self._log(p.stdout or "")
+                if p.returncode != 0:
+                    self._log(p.stderr or "")
+                    messagebox.showerror("Piper error", f"Piper failed (rc={p.returncode}). See logs.")
                     return
             except Exception as e:
-                messagebox.showerror("Sentence SRT launch error", str(e)); return
-        else:
+                messagebox.showerror("Piper launch error", str(e)); return
+
             # json_to_srt (UI-safe)
             srt_path = VOICE_BUILD_DIR / f"{base}.srt"
             self._log(f"[srt] {JSON_TO_SRT} → {srt_path}\n")

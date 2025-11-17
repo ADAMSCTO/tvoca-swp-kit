@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# JirehFaith SWP Kit — Single-Screen Launcher (Brand)
+# TVOCA — Text → Voice → Captions → Video (Single-Screen Launcher)
 # Flow:
 #   UI text/JSON → WAV (piper profile) → SRT →
 #   render_swp_unified.sh (ASS normalize/repair + CenterBox → burn)
@@ -161,7 +161,7 @@ def build_text_from_json(json_path: Path) -> str:
 def write_tmp_json_from_text(emotion: str, lang: str, voice: str, text: str, base: str) -> Path:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not lines:
-        raise ValueError("Prayer text is empty. Provide JSON or enter lines in the text box.")
+        raise ValueError("Script text is empty. Provide JSON or enter lines in the text box.")
     data = {
         "emotion": emotion.lower(),
         "language": lang,
@@ -177,7 +177,7 @@ def write_tmp_json_from_text(emotion: str, lang: str, voice: str, text: str, bas
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("JirehFaith SWP Kit — Launcher")
+        self.title("TVOCA — Text → Voice → Captions → Video")
         self.geometry("1120x980")
         self.minsize(1020, 820)
         self.configure(bg=JF_BG)
@@ -306,7 +306,7 @@ class Launcher(tk.Tk):
         self._entry(row5, self.var_min_ms, 6).pack(side="left", padx=(6,0))
 
         # Middle — Text area
-        mid = tk.LabelFrame(card, text="Prayer text (one line per caption; used if no JSON is selected)", bg="white", fg=JF_TEXT, labelanchor="nw")
+        mid = tk.LabelFrame(card, text="Script text (one line per caption; used if no JSON is selected)", bg="white", fg=JF_TEXT, labelanchor="nw")
         mid.configure(highlightbackground="#efeaf7", highlightthickness=1)
         mid.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
@@ -317,11 +317,12 @@ class Launcher(tk.Tk):
 
         self.txt = tk.Text(mid, height=12, wrap="word", bg="#ffffff", fg=JF_TEXT, insertbackground=JF_PURPLE)
         self.txt.pack(fill="both", expand=True, padx=6, pady=6)
-        self.txt.insert("1.0",
-            "Father, I cast my cares on You, knowing You care for me.\n"
-            "Steady my thoughts and quiet my heart in Your presence.\n"
-            "Teach me to trust Your timing and Your faithful love.\n"
-            "Anchor me in Your peace as I wait on You."
+        self.txt.insert(
+            "1.0",
+            "This is a sample line of narration.\n"
+            "Each new line becomes its own caption.\n"
+            "Use short, clear sentences for best readability.\n"
+            "When you are ready, click Start to build your video."
         )
 
         # Bottom controls
@@ -346,8 +347,12 @@ class Launcher(tk.Tk):
     # --- brand ---
     def _brand_bar(self, parent):
         bar = tk.Frame(parent, bg=JF_PURPLE, height=56); bar.pack(fill="x", side="top")
-        tk.Label(bar, text="JirehFaith — Scripture-Woven Prayer (SWP) Kit",
-                 bg=JF_PURPLE, fg=JF_GOLD, font=("Segoe UI", 14, "bold")
+        tk.Label(
+            bar,
+            text="TVOCA — Text → Voice → Captions → Video",
+            bg=JF_PURPLE,
+            fg=JF_GOLD,
+            font=("Segoe UI", 14, "bold"),
         ).pack(side="left", padx=14, pady=10)
 
     # --- tiny UI helpers ---
@@ -393,9 +398,9 @@ class Launcher(tk.Tk):
     def copy_input_to_clipboard(self):
         text = self.txt.get("1.0", "end").strip()
         if not text:
-            messagebox.showinfo("No text", "The prayer input box is empty."); return
+            messagebox.showinfo("No text", "The script input box is empty."); return
         self.clipboard_clear(); self.clipboard_append(text)
-        self._log("[info] Copied prayer input to clipboard.\n")
+        self._log("[info] Copied script input to clipboard.\n")
 
     def copy_logs(self):
         self.log.configure(state="normal")
@@ -471,7 +476,7 @@ class Launcher(tk.Tk):
                 json_path = write_tmp_json_from_text(
                     self.var_emotion.get(), self.var_lang.get(), self.var_voice.get(),
                     self.txt.get("1.0", "end").strip(),
-                    self.var_title.get().strip() or "prayer_ui"
+                    self.var_title.get().strip() or "tvoca_ui"
                 )
                 self._log(f"[info] Wrote JSON: {json_path}\n")
             except Exception as e:
@@ -534,7 +539,7 @@ class Launcher(tk.Tk):
             # 5) Concatenate clips → final wav_path
             lines_text = self.txt.get("1.0", "end").strip()
             if not lines_text:
-                messagebox.showerror("No lines", "Sentence-locked mode requires lines in the Prayer text box.")
+                messagebox.showerror("No lines", "Sentence-locked mode requires lines in the Script text box.")
                 return
 
             script_txt = VOICE_SCRIPT_DIR / f"{base}.txt"
